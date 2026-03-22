@@ -185,6 +185,7 @@ class TarArchiveManager:
     def __init__(self, tar_file_path: str, passphrase: str = None):
         self.tar_lock = threading.RLock()
         self.tar_file_path = tar_file_path
+        self.is_encrypted = passphrase is not None
         
         if tar_file_path.endswith(".gpg"):
             if not passphrase:
@@ -2072,6 +2073,10 @@ class DreamBoothDataset(BaseDataset):
             self.bucket_no_upscale = False
 
         def read_caption(img_path, caption_extension, enable_wildcard, tar_manager=None):
+            # Privacy flag for logging
+            is_enc = tar_manager.is_encrypted if tar_manager else False
+            safe_path = "<REDACTED_PATH>" if is_enc else img_path
+            
             # captionの候補ファイル名を作る
             base_name = os.path.splitext(img_path)[0]
             base_name_face_det = base_name
@@ -2097,9 +2102,9 @@ class DreamBoothDataset(BaseDataset):
                             try:
                                 lines = f.readlines()
                             except UnicodeDecodeError as e:
-                                logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
+                                logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {safe_path}")
                                 raise e
-                            assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
+                            assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {safe_path}"
                             if enable_wildcard:
                                 caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
                             else:
@@ -2236,11 +2241,16 @@ class DreamBoothDataset(BaseDataset):
                 logger.warning(
                     f"No caption file found for {number_of_missing_captions} images. Training will continue without captions for these images. If class token exists, it will be used. / {number_of_missing_captions}枚の画像にキャプションファイルが見つかりませんでした。これらの画像についてはキャプションなしで学習を続行します。class tokenが存在する場合はそれを使います。"
                 )
-                for i, missing_caption in enumerate(missing_captions):
-                    if i >= number_of_missing_captions_to_show:
-                        logger.warning(missing_caption + f"... and {remaining_missing_captions} more")
-                        break
-                    logger.warning(missing_caption)
+                
+                is_enc = subset.tar_manager.is_encrypted if getattr(subset, "tar_manager", None) else False
+                if is_enc:
+                    logger.warning("(Filenames redacted for privacy / プライバシー保護のためファイル名は伏せられています)")
+                else:
+                    for i, missing_caption in enumerate(missing_captions):
+                        if i >= number_of_missing_captions_to_show:
+                            logger.warning(missing_caption + f"... and {remaining_missing_captions} more")
+                            break
+                        logger.warning(missing_caption)
 
             if not use_cached_info_for_subset and subset.cache_info:
                 logger.info(f"cache image info for / 画像情報をキャッシュします : {info_cache_file}")
