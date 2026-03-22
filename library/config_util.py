@@ -76,6 +76,8 @@ class BaseSubsetParams:
     validation_seed: int = 0
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
+    dataset_tar_file: Optional[str] = None
+    dataset_passphrase: Optional[str] = None
 
 
 @dataclass
@@ -198,6 +200,8 @@ class ConfigSanitizer:
         "caption_suffix": str,
         "custom_attributes": dict,
         "resize_interpolation": str,
+        "dataset_tar_file": str,
+        "dataset_passphrase": str,
     }
     # DO means DropOut
     DO_SUBSET_ASCENDABLE_SCHEMA = {
