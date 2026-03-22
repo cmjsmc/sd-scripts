@@ -547,9 +547,15 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                 info += "\n"
 
             for j, subset in enumerate(dataset.subsets):
+                # Check for encryption to mask sensitive output
+                is_enc = getattr(subset, "tar_manager", None) is not None and subset.tar_manager.is_encrypted
+                safe_image_dir = "<REDACTED_FOR_PRIVACY>" if is_enc else subset.image_dir
+                safe_prefix = "<REDACTED>" if is_enc and subset.caption_prefix else subset.caption_prefix
+                safe_suffix = "<REDACTED>" if is_enc and subset.caption_suffix else subset.caption_suffix
+
                 info += indent(dedent(f"""\
                   [Subset {j} of {dataset_type} {i}]
-                    image_dir: "{subset.image_dir}"
+                    image_dir: "{safe_image_dir}"
                     image_count: {subset.img_count}
                     num_repeats: {subset.num_repeats}
                     shuffle_caption: {subset.shuffle_caption}
@@ -557,8 +563,8 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     caption_dropout_rate: {subset.caption_dropout_rate}
                     caption_dropout_every_n_epochs: {subset.caption_dropout_every_n_epochs}
                     caption_tag_dropout_rate: {subset.caption_tag_dropout_rate}
-                    caption_prefix: {subset.caption_prefix}
-                    caption_suffix: {subset.caption_suffix}
+                    caption_prefix: {safe_prefix}
+                    caption_suffix: {safe_suffix}
                     color_aug: {subset.color_aug}
                     flip_aug: {subset.flip_aug}
                     face_crop_aug_range: {subset.face_crop_aug_range}
