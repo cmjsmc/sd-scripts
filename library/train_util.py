@@ -23,6 +23,9 @@ import hashlib
 import subprocess
 from io import BytesIO
 import toml
+import tarfile
+import io
+import threading
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -178,9 +181,116 @@ def split_train_val(
         return paths[split:], sizes[split:]
 
 
+class TarArchiveManager:
+    def __init__(self, tar_file_path: str, passphrase: str = None):
+        self.tar_lock = threading.RLock()
+        self.tar_file_path = tar_file_path
+        self.is_encrypted = passphrase is not None
+        
+        if tar_file_path.endswith(".gpg"):
+            if not passphrase:
+                raise ValueError("Encrypted dataset requires a passphrase. Please specify 'dataset_passphrase'.")
+            try:
+                import gnupg
+            except ImportError:
+                raise ImportError("python-gnupg is required for encrypted datasets. Please 'pip install python-gnupg'")
+            
+            logger.info(f"Decrypting {tar_file_path} into memory...")
+            gpg = gnupg.GPG()
+            with open(tar_file_path, "rb") as f:
+                decrypted_data = gpg.decrypt_file(f, passphrase=passphrase)
+                if not decrypted_data.ok:
+                    raise RuntimeError(f"Decryption failed: {decrypted_data.status}")
+                
+                self.data_stream = io.BytesIO(decrypted_data.data)
+                self.tar_obj = tarfile.open(fileobj=self.data_stream, mode="r:")
+        else:
+            self.tar_obj = tarfile.open(tar_file_path, mode="r:")
+            
+        self._build_index()
+
+    def _build_index(self):
+        self.members_map = {}
+        self.keys = []
+        for member in self.tar_obj.getmembers():
+            if member.isfile():
+                norm_name = os.path.normpath(member.name).replace('\\', '/')
+                self.members_map[norm_name] = member
+                self.keys.append(norm_name)
+
+    def _get_member(self, filename: str):
+        norm_name = os.path.normpath(filename).replace('\\', '/')
+        if norm_name in self.members_map:
+            return self.members_map[norm_name]
+        for k in self.members_map:
+            if norm_name.endswith(k) or k.endswith(norm_name):
+                return self.members_map[k]
+        return None
+
+    def read_text_file(self, filename: str) -> str:
+        tar_member = self._get_member(filename)
+        if not tar_member:
+            return None
+        try:
+            with self.tar_lock:
+                extracted = self.tar_obj.extractfile(tar_member)
+                if extracted:
+                    return extracted.read().decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Failed to read text file from tar: {filename}, error: {e}")
+        return None
+
+    def get_image(self, filename: str, alpha: bool = False):
+        tar_member = self._get_member(filename)
+        if not tar_member:
+            raise FileNotFoundError(f"{filename} not found in tar archive.")
+
+        try:
+            with self.tar_lock:
+                extracted = self.tar_obj.extractfile(tar_member)
+                if extracted:
+                    raw_bytes = extracted.read()
+                else:
+                    raw_bytes = None
+        except Exception as e:
+            raise IOError(f"Failed to read tar member {filename}") from e
+
+        if raw_bytes is None:
+            raise ValueError(f"Could not extract {filename}")
+
+        byte_stream = io.BytesIO(raw_bytes)
+        image = Image.open(byte_stream)
+        
+        if alpha:
+            if image.mode != "RGBA":
+                image = image.convert("RGBA")
+        else:
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+                
+        image.load()
+        return np.array(image, np.uint8)
+
+    def get_image_size(self, filename: str):
+        tar_member = self._get_member(filename)
+        if not tar_member:
+            return (0, 0)
+        try:
+            with self.tar_lock:
+                extracted = self.tar_obj.extractfile(tar_member)
+                if extracted:
+                    raw_bytes = extracted.read()
+                else:
+                    return (0, 0)
+            img = Image.open(io.BytesIO(raw_bytes))
+            return img.size
+        except Exception:
+            return (0, 0)
+
+
 class ImageInfo:
     def __init__(
-        self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, caption_dropout_rate: float = 0.0
+        self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, caption_dropout_rate: float = 0.0, tar_manager: TarArchiveManager = None
     ) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
@@ -211,6 +321,7 @@ class ImageInfo:
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
         self.resize_interpolation: Optional[str] = None
+        self.tar_manager = tar_manager
 
 
 class BucketManager:
@@ -436,6 +547,8 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -467,6 +580,8 @@ class BaseSubset:
         self.validation_split = validation_split
 
         self.resize_interpolation = resize_interpolation
+        self.dataset_tar_file = dataset_tar_file
+        self.tar_manager = TarArchiveManager(dataset_tar_file, dataset_passphrase) if dataset_tar_file else None
 
 
 class DreamBoothSubset(BaseSubset):
@@ -500,6 +615,8 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -528,6 +645,8 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            dataset_tar_file=dataset_tar_file,
+            dataset_passphrase=dataset_passphrase,
         )
 
         self.is_reg = is_reg
@@ -571,6 +690,8 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -599,6 +720,8 @@ class FineTuningSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            dataset_tar_file=dataset_tar_file,
+            dataset_passphrase=dataset_passphrase,
         )
 
         self.metadata_file = metadata_file
@@ -638,6 +761,8 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -666,6 +791,8 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            dataset_tar_file=dataset_tar_file,
+            dataset_passphrase=dataset_passphrase,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -999,7 +1126,7 @@ class BaseDataset(torch.utils.data.Dataset):
         logger.info("loading image sizes.")
         for info in tqdm(self.image_data.values()):
             if info.image_size is None:
-                info.image_size = self.get_image_size(info.absolute_path)
+                info.image_size = self.get_image_size(info.absolute_path, tar_manager=info.tar_manager)
 
         # # run in parallel
         # max_workers = min(os.cpu_count(), len(self.image_data))  # TODO consider multi-gpu (processes)
@@ -1210,7 +1337,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 if info.image is None:
                     # load image in parallel
-                    info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask)
+                    info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask, tar_manager=info.tar_manager)
 
                 batch.append(info)
                 current_condition = condition
@@ -1483,7 +1610,9 @@ class BaseDataset(torch.utils.data.Dataset):
                     output_dtype,
                 )
 
-    def get_image_size(self, image_path):
+    def get_image_size(self, image_path, tar_manager=None):
+        if tar_manager is not None:
+            return tar_manager.get_image_size(image_path)
         if image_path.endswith(".jxl") or image_path.endswith(".JXL"):
             return get_jxl_size(image_path)
         # return imagesize.get(image_path)
@@ -1498,8 +1627,8 @@ class BaseDataset(torch.utils.data.Dataset):
                 image_size = (0, 0)
         return image_size
 
-    def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False):
-        img = load_image(image_path, alpha_mask)
+    def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False, tar_manager=None):
+        img = load_image(image_path, alpha_mask, tar_manager=tar_manager)
 
         face_cx = face_cy = face_w = face_h = 0
         if subset.face_crop_aug_range is not None:
@@ -1625,7 +1754,7 @@ class BaseDataset(torch.utils.data.Dataset):
             else:
                 # 画像を読み込み、必要ならcropする
                 img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
-                    subset, image_info.absolute_path, subset.alpha_mask
+                    subset, image_info.absolute_path, subset.alpha_mask, tar_manager=image_info.tar_manager
                 )
                 im_h, im_w = img.shape[0:2]
 
@@ -1877,7 +2006,7 @@ class BaseDataset(torch.utils.data.Dataset):
             caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
 
             if self.caching_mode == "latents":
-                image = load_image(image_info.absolute_path)
+                image = load_image(image_info.absolute_path, tar_manager=image_info.tar_manager)
             else:
                 image = None
 
@@ -1998,7 +2127,11 @@ class DreamBoothDataset(BaseDataset):
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
 
-        def read_caption(img_path, caption_extension, enable_wildcard):
+        def read_caption(img_path, caption_extension, enable_wildcard, tar_manager=None):
+            # Privacy flag for logging
+            is_enc = tar_manager.is_encrypted if tar_manager else False
+            safe_path = "<REDACTED_PATH>" if is_enc else img_path
+            
             # captionの候補ファイル名を作る
             base_name = os.path.splitext(img_path)[0]
             base_name_face_det = base_name
@@ -2009,85 +2142,103 @@ class DreamBoothDataset(BaseDataset):
 
             caption = None
             for cap_path in cap_paths:
-                if os.path.isfile(cap_path):
-                    with open(cap_path, "rt", encoding="utf-8") as f:
-                        try:
-                            lines = f.readlines()
-                        except UnicodeDecodeError as e:
-                            logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
-                            raise e
-                        assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
+                if tar_manager is not None:
+                    content = tar_manager.read_text_file(cap_path)
+                    if content is not None:
+                        lines = content.strip().split('\n')
                         if enable_wildcard:
-                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])
                         else:
                             caption = lines[0].strip()
-                    break
+                        break
+                else:
+                    if os.path.isfile(cap_path):
+                        with open(cap_path, "rt", encoding="utf-8") as f:
+                            try:
+                                lines = f.readlines()
+                            except UnicodeDecodeError as e:
+                                logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {safe_path}")
+                                raise e
+                            assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {safe_path}"
+                            if enable_wildcard:
+                                caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                            else:
+                                caption = lines[0].strip()
+                        break
             return caption
 
         def load_dreambooth_dir(subset: DreamBoothSubset):
-            if not os.path.isdir(subset.image_dir):
-                logger.warning(f"not directory: {subset.image_dir}")
-                return [], [], []
-
-            info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
-            use_cached_info_for_subset = subset.cache_info
-            if use_cached_info_for_subset:
-                logger.info(
-                    f"using cached image info for this subset / このサブセットで、キャッシュされた画像情報を使います: {info_cache_file}"
-                )
-                if not os.path.isfile(info_cache_file):
-                    logger.warning(
-                        f"image info file not found. You can ignore this warning if this is the first time to use this subset"
-                        + " / キャッシュファイルが見つかりませんでした。初回実行時はこの警告を無視してください: {metadata_file}"
-                    )
-                    use_cached_info_for_subset = False
-
-            if use_cached_info_for_subset:
-                # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
-                with open(info_cache_file, "r", encoding="utf-8") as f:
-                    metas = json.load(f)
-                img_paths = list(metas.keys())
-                sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
-
-                # we may need to check image size and existence of image files, but it takes time, so user should check it before training
+            if subset.tar_manager is not None:
+                img_paths = [p for p in subset.tar_manager.keys if os.path.splitext(p)[1] in IMAGE_EXTENSIONS]
+                if subset.image_dir and subset.image_dir != "" and subset.image_dir != "dummy":
+                    prefix = os.path.normpath(subset.image_dir).replace('\\', '/')
+                    img_paths = [p for p in img_paths if p.startswith(prefix) or prefix in p]
+                sizes = [None] * len(img_paths)
+                logger.info(f"found {len(img_paths)} images in tar archive")
+                use_cached_info_for_subset = False
             else:
-                img_paths = glob_images(subset.image_dir, "*")
-                sizes: List[Optional[Tuple[int, int]]] = [None] * len(img_paths)
+                if not os.path.isdir(subset.image_dir):
+                    logger.warning(f"not directory: {subset.image_dir}")
+                    return [], [], []
+                info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
+                use_cached_info_for_subset = subset.cache_info
+                if use_cached_info_for_subset:
+                    logger.info(
+                        f"using cached image info for this subset / このサブセットで、キャッシュされた画像情報を使います: {info_cache_file}"
+                    )
+                    if not os.path.isfile(info_cache_file):
+                        logger.warning(
+                            f"image info file not found. You can ignore this warning if this is the first time to use this subset"
+                            + " / キャッシュファイルが見つかりませんでした。初回実行時はこの警告を無視してください: {metadata_file}"
+                        )
+                        use_cached_info_for_subset = False
 
-                # new caching: get image size from cache files
-                strategy = LatentsCachingStrategy.get_strategy()
-                if strategy is not None:
-                    logger.info("get image size from name of cache files")
+                if use_cached_info_for_subset:
+                    # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
+                    with open(info_cache_file, "r", encoding="utf-8") as f:
+                        metas = json.load(f)
+                    img_paths = list(metas.keys())
+                    sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
 
-                    # make image path to npz path mapping
-                    npz_paths = glob.glob(os.path.join(subset.image_dir, "*" + strategy.cache_suffix))
-                    npz_paths.sort(
-                        key=lambda item: item.rsplit("_", maxsplit=2)[0]
-                    )  # sort by name excluding resolution and cache_suffix
-                    npz_path_index = 0
+                    # we may need to check image size and existence of image files, but it takes time, so user should check it before training
+                else:
+                    img_paths = glob_images(subset.image_dir, "*")
+                    sizes: List[Optional[Tuple[int, int]]] = [None] * len(img_paths)
 
-                    size_set_count = 0
-                    for i, img_path in enumerate(tqdm(img_paths)):
-                        l = len(os.path.splitext(img_path)[0])  # remove extension
-                        found = False
-                        while npz_path_index < len(npz_paths):  # until found or end of npz_paths
-                            # npz_paths are sorted, so if npz_path > img_path, img_path is not found
-                            if npz_paths[npz_path_index][:l] > img_path[:l]:
-                                break
-                            if npz_paths[npz_path_index][:l] == img_path[:l]:  # found
-                                found = True
-                                break
-                            npz_path_index += 1  # next npz_path
+                    # new caching: get image size from cache files
+                    strategy = LatentsCachingStrategy.get_strategy()
+                    if strategy is not None:
+                        logger.info("get image size from name of cache files")
 
-                        if found:
-                            w, h = strategy.get_image_size_from_disk_cache_path(img_path, npz_paths[npz_path_index])
-                        else:
-                            w, h = None, None
+                        # make image path to npz path mapping
+                        npz_paths = glob.glob(os.path.join(subset.image_dir, "*" + strategy.cache_suffix))
+                        npz_paths.sort(
+                            key=lambda item: item.rsplit("_", maxsplit=2)[0]
+                        )  # sort by name excluding resolution and cache_suffix
+                        npz_path_index = 0
 
-                        if w is not None and h is not None:
-                            sizes[i] = (w, h)
-                            size_set_count += 1
-                    logger.info(f"set image size from cache files: {size_set_count}/{len(img_paths)}")
+                        size_set_count = 0
+                        for i, img_path in enumerate(tqdm(img_paths)):
+                            l = len(os.path.splitext(img_path)[0])  # remove extension
+                            found = False
+                            while npz_path_index < len(npz_paths):  # until found or end of npz_paths
+                                # npz_paths are sorted, so if npz_path > img_path, img_path is not found
+                                if npz_paths[npz_path_index][:l] > img_path[:l]:
+                                    break
+                                if npz_paths[npz_path_index][:l] == img_path[:l]:  # found
+                                    found = True
+                                    break
+                                npz_path_index += 1  # next npz_path
+
+                            if found:
+                                w, h = strategy.get_image_size_from_disk_cache_path(img_path, npz_paths[npz_path_index])
+                            else:
+                                w, h = None, None
+
+                            if w is not None and h is not None:
+                                sizes[i] = (w, h)
+                                size_set_count += 1
+                        logger.info(f"set image size from cache files: {size_set_count}/{len(img_paths)}")
 
             if self.skip_image_resolution is not None:
                 filtered_img_paths = []
@@ -2139,7 +2290,7 @@ class DreamBoothDataset(BaseDataset):
                 captions = []
                 missing_captions = []
                 for img_path in tqdm(img_paths, desc="read caption"):
-                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
+                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard, tar_manager=subset.tar_manager)
                     if cap_for_img is None and subset.class_tokens is None:
                         logger.warning(
                             f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
@@ -2163,15 +2314,20 @@ class DreamBoothDataset(BaseDataset):
                 logger.warning(
                     f"No caption file found for {number_of_missing_captions} images. Training will continue without captions for these images. If class token exists, it will be used. / {number_of_missing_captions}枚の画像にキャプションファイルが見つかりませんでした。これらの画像についてはキャプションなしで学習を続行します。class tokenが存在する場合はそれを使います。"
                 )
-                for i, missing_caption in enumerate(missing_captions):
-                    if i >= number_of_missing_captions_to_show:
-                        logger.warning(missing_caption + f"... and {remaining_missing_captions} more")
-                        break
-                    logger.warning(missing_caption)
+                
+                is_enc = subset.tar_manager.is_encrypted if getattr(subset, "tar_manager", None) else False
+                if is_enc:
+                    logger.warning("(Filenames redacted for privacy / プライバシー保護のためファイル名は伏せられています)")
+                else:
+                    for i, missing_caption in enumerate(missing_captions):
+                        if i >= number_of_missing_captions_to_show:
+                            logger.warning(missing_caption + f"... and {remaining_missing_captions} more")
+                            break
+                        logger.warning(missing_caption)
 
             if not use_cached_info_for_subset and subset.cache_info:
                 logger.info(f"cache image info for / 画像情報をキャッシュします : {info_cache_file}")
-                sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size")]
+                sizes = [self.get_image_size(img_path, tar_manager=subset.tar_manager) for img_path in tqdm(img_paths, desc="get image size")]
                 matas = {}
                 for img_path, caption, size in zip(img_paths, captions, sizes):
                     matas[img_path] = {"caption": caption, "resolution": list(size)}
@@ -2213,7 +2369,7 @@ class DreamBoothDataset(BaseDataset):
                 num_train_images += num_repeats * len(img_paths)
 
             for img_path, caption, size in zip(img_paths, captions, sizes):
-                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, img_path, subset.caption_dropout_rate)
+                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, img_path, subset.caption_dropout_rate, tar_manager=subset.tar_manager)
                 info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
@@ -2321,7 +2477,25 @@ class FineTuningDataset(BaseDataset):
                 continue
 
             # メタデータを読み込む
-            if os.path.exists(subset.metadata_file):
+            if subset.tar_manager is not None and not os.path.exists(subset.metadata_file):
+                logger.info(f"loading metadata from tar: {subset.metadata_file}")
+                md_content = subset.tar_manager.read_text_file(subset.metadata_file)
+                if md_content is not None:
+                    if subset.metadata_file.endswith(".jsonl"):
+                        metadata = {}
+                        for line in md_content.strip().split('\n'):
+                            line_md = json.loads(line)
+                            image_md = {"caption": line_md.get("caption", "")}
+                            if "image_size" in line_md:
+                                image_md["image_size"] = line_md["image_size"]
+                            if "tags" in line_md:
+                                image_md["tags"] = line_md["tags"]
+                            metadata[line_md["image_path"]] = image_md
+                    else:
+                        metadata = json.loads(md_content)
+                else:
+                    raise ValueError(f"no metadata in tar / ターアーカイブ内にメタデータファイルがありません: {subset.metadata_file}")
+            elif os.path.exists(subset.metadata_file):
                 if subset.metadata_file.endswith(".jsonl"):
                     logger.info(f"loading existing JSOL metadata: {subset.metadata_file}")
                     # optional JSONL format
@@ -2432,7 +2606,7 @@ class FineTuningDataset(BaseDataset):
                 if caption is None:
                     caption = ""
 
-                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset.caption_dropout_rate)
+                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset.caption_dropout_rate, tar_manager=subset.tar_manager)
                 image_info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
@@ -2533,6 +2707,8 @@ class ControlNetDataset(BaseDataset):
                 subset.token_warmup_min,
                 subset.token_warmup_step,
                 resize_interpolation=subset.resize_interpolation,
+                dataset_tar_file=subset.dataset_tar_file,
+                dataset_passphrase=subset.dataset_passphrase,
             )
             db_subsets.append(db_subset)
 
@@ -3058,7 +3234,9 @@ def load_arbitrary_dataset(args, tokenizer=None) -> MinimalDataset:
     return train_dataset_group
 
 
-def load_image(image_path, alpha=False):
+def load_image(image_path, alpha=False, tar_manager=None):
+    if tar_manager is not None:
+        return tar_manager.get_image(image_path, alpha)
     try:
         with Image.open(image_path) as image:
             if alpha:
@@ -3125,7 +3303,7 @@ def load_images_and_masks_for_caching(
     original_sizes: List[Tuple[int, int]] = []
     crop_ltrbs: List[Tuple[int, int, int, int]] = []
     for info in image_infos:
-        image = load_image(info.absolute_path, use_alpha_mask) if info.image is None else np.array(info.image, np.uint8)
+        image = load_image(info.absolute_path, use_alpha_mask, tar_manager=info.tar_manager) if info.image is None else np.array(info.image, np.uint8)
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
         image, original_size, crop_ltrb = trim_and_resize_if_required(
             random_crop, image, info.bucket_reso, info.resized_size, resize_interpolation=info.resize_interpolation
@@ -3168,7 +3346,7 @@ def cache_batch_latents(
     images = []
     alpha_masks: List[np.ndarray] = []
     for info in image_infos:
-        image = load_image(info.absolute_path, use_alpha_mask) if info.image is None else np.array(info.image, np.uint8)
+        image = load_image(info.absolute_path, use_alpha_mask, tar_manager=info.tar_manager) if info.image is None else np.array(info.image, np.uint8)
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
         image, original_size, crop_ltrb = trim_and_resize_if_required(
             random_crop, image, info.bucket_reso, info.resized_size, resize_interpolation=info.resize_interpolation
