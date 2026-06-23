@@ -154,11 +154,17 @@ class FineTuningDataset(BaseDataset):
                     image_dirs.add(os.path.dirname(abs_path))
 
                 # if image_key does not have extension, try to find image file with supported extensions
-                if not os.path.splitext(image_key)[1] or not os.path.exists(abs_path):  # no extension or file does not exist
-                    paths = glob_images(os.path.dirname(abs_path), os.path.basename(image_key))
-                    if len(paths) > 0:
-                        abs_path = paths[0]
-                    # If no file is found, we use *.npz file to get image size and for training
+                if subset.tar_manager is not None:
+                    # Resolve inside the TAR archive
+                    if not os.path.splitext(image_key)[1]:
+                        abs_path = subset.tar_manager.get_resolved_path(abs_path)
+                else:
+                    # Resolve on the local filesystem
+                    if not os.path.splitext(image_key)[1] or not os.path.exists(abs_path):  # no extension or file does not exist
+                        paths = glob_images(os.path.dirname(abs_path), os.path.basename(image_key))
+                        if len(paths) > 0:
+                            abs_path = paths[0]
+                        # If no file is found, we use *.npz file to get image size and for training
 
                 metadata[image_key]["abs_path"] = abs_path
 
