@@ -86,7 +86,7 @@ def load_images_and_masks_for_caching(
     crop_ltrbs: List[Tuple[int, int, int, int]] = []
     for info in image_infos:
         image = (
-            load_image(info.absolute_path, use_alpha_mask)
+            load_image(info.absolute_path, use_alpha_mask, tar_manager=info.tar_manager)
             if info.image is None
             else np.array(info.image, np.uint8)
         )
@@ -138,7 +138,7 @@ def cache_batch_latents(
     alpha_masks: List[np.ndarray] = []
     for info in image_infos:
         image = (
-            load_image(info.absolute_path, use_alpha_mask)
+            load_image(info.absolute_path, use_alpha_mask, tar_manager=info.tar_manager)
             if info.image is None
             else np.array(info.image, np.uint8)
         )
