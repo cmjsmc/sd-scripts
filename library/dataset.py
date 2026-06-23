@@ -31,6 +31,9 @@ import os
 import pathlib
 import random
 import re
+import tarfile
+import io
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -143,9 +146,116 @@ def split_train_val(
         return paths[split:], sizes[split:]
 
 
+class TarArchiveManager:
+    def __init__(self, tar_file_path: str, passphrase: str = None):
+        self.tar_lock = threading.RLock()
+        self.tar_file_path = tar_file_path
+        self.is_encrypted = passphrase is not None
+
+        if tar_file_path.endswith(".gpg"):
+            if not passphrase:
+                raise ValueError("Encrypted dataset requires a passphrase. Please specify 'dataset_passphrase'.")
+            try:
+                import gnupg
+            except ImportError:
+                raise ImportError("python-gnupg is required for encrypted datasets. Please 'pip install python-gnupg'")
+
+            logger.info(f"Decrypting {tar_file_path} into memory...")
+            gpg = gnupg.GPG()
+            with open(tar_file_path, "rb") as f:
+                decrypted_data = gpg.decrypt_file(f, passphrase=passphrase)
+                if not decrypted_data.ok:
+                    raise RuntimeError(f"Decryption failed: {decrypted_data.status}")
+
+                self.data_stream = io.BytesIO(decrypted_data.data)
+                self.tar_obj = tarfile.open(fileobj=self.data_stream, mode="r:")
+        else:
+            self.tar_obj = tarfile.open(tar_file_path, mode="r:")
+
+        self._build_index()
+
+    def _build_index(self):
+        self.members_map = {}
+        self.keys = []
+        for member in self.tar_obj.getmembers():
+            if member.isfile():
+                norm_name = os.path.normpath(member.name).replace('\\', '/')
+                self.members_map[norm_name] = member
+                self.keys.append(norm_name)
+
+    def _get_member(self, filename: str):
+        norm_name = os.path.normpath(filename).replace('\\', '/')
+        if norm_name in self.members_map:
+            return self.members_map[norm_name]
+        for k in self.members_map:
+            if norm_name.endswith(k) or k.endswith(norm_name):
+                return self.members_map[k]
+        return None
+
+    def read_text_file(self, filename: str) -> str:
+        tar_member = self._get_member(filename)
+        if not tar_member:
+            return None
+        try:
+            with self.tar_lock:
+                extracted = self.tar_obj.extractfile(tar_member)
+                if extracted:
+                    return extracted.read().decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Failed to read text file from tar: {filename}, error: {e}")
+        return None
+
+    def get_image(self, filename: str, alpha: bool = False):
+        tar_member = self._get_member(filename)
+        if not tar_member:
+            raise FileNotFoundError(f"{filename} not found in tar archive.")
+
+        try:
+            with self.tar_lock:
+                extracted = self.tar_obj.extractfile(tar_member)
+                if extracted:
+                    raw_bytes = extracted.read()
+                else:
+                    raw_bytes = None
+        except Exception as e:
+            raise IOError(f"Failed to read tar member {filename}") from e
+
+        if raw_bytes is None:
+            raise ValueError(f"Could not extract {filename}")
+
+        byte_stream = io.BytesIO(raw_bytes)
+        image = Image.open(byte_stream)
+
+        if alpha:
+            if image.mode != "RGBA":
+                image = image.convert("RGBA")
+        else:
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+
+        image.load()
+        return np.array(image, np.uint8)
+
+    def get_image_size(self, filename: str):
+        tar_member = self._get_member(filename)
+        if not tar_member:
+            return (0, 0)
+        try:
+            with self.tar_lock:
+                extracted = self.tar_obj.extractfile(tar_member)
+                if extracted:
+                    raw_bytes = extracted.read()
+                else:
+                    return (0, 0)
+            img = Image.open(io.BytesIO(raw_bytes))
+            return img.size
+        except Exception:
+            return (0, 0)
+
+
 class ImageInfo:
     def __init__(
-        self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, caption_dropout_rate: float = 0.0
+        self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, caption_dropout_rate: float = 0.0, tar_manager: TarArchiveManager = None
     ) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
@@ -176,6 +286,7 @@ class ImageInfo:
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
         self.resize_interpolation: Optional[str] = None
+        self.tar_manager = tar_manager
 
 
 class BucketManager:
@@ -623,7 +734,7 @@ class BaseDataset(torch.utils.data.Dataset):
         logger.info("loading image sizes.")
         for info in tqdm(self.image_data.values()):
             if info.image_size is None:
-                info.image_size = self.get_image_size(info.absolute_path)
+                info.image_size = self.get_image_size(info.absolute_path, tar_manager=info.tar_manager)
 
         # # run in parallel
         # max_workers = min(os.cpu_count(), len(self.image_data))  # TODO consider multi-gpu (processes)
@@ -834,7 +945,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 if info.image is None:
                     # load image in parallel
-                    info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask)
+                    info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask, tar_manager=info.tar_manager)
 
                 batch.append(info)
                 current_condition = condition
@@ -906,7 +1017,9 @@ class BaseDataset(torch.utils.data.Dataset):
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
             caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
 
-    def get_image_size(self, image_path):
+    def get_image_size(self, image_path, tar_manager=None):
+        if tar_manager is not None:
+            return tar_manager.get_image_size(image_path)
         if image_path.endswith(".jxl") or image_path.endswith(".JXL"):
             return get_jxl_size(image_path)
         # return imagesize.get(image_path)
@@ -921,8 +1034,8 @@ class BaseDataset(torch.utils.data.Dataset):
                 image_size = (0, 0)
         return image_size
 
-    def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False):
-        img = load_image(image_path, alpha_mask)
+    def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False, tar_manager=None):
+        img = load_image(image_path, alpha_mask, tar_manager=tar_manager)
 
         face_cx = face_cy = face_w = face_h = 0
         if subset.face_crop_aug_range is not None:
@@ -1045,7 +1158,7 @@ class BaseDataset(torch.utils.data.Dataset):
             else:
                 # 画像を読み込み、必要ならcropする
                 img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
-                    subset, image_info.absolute_path, subset.alpha_mask
+                    subset, image_info.absolute_path, subset.alpha_mask, tar_manager=image_info.tar_manager
                 )
                 im_h, im_w = img.shape[0:2]
 
@@ -1537,16 +1650,6 @@ class MinimalDataset(BaseDataset):
 
     def get_resolutions(self) -> List[Tuple[int, int]]:
         return []
-
-
-
-def load_arbitrary_dataset(args, tokenizer=None) -> MinimalDataset:
-    module = ".".join(args.dataset_class.split(".")[:-1])
-    dataset_class = args.dataset_class.split(".")[-1]
-    module = importlib.import_module(module)
-    dataset_class = getattr(module, dataset_class)
-    train_dataset_group: MinimalDataset = dataset_class(tokenizer, args.max_token_length, args.resolution, args.debug_dataset)
-    return train_dataset_group
 
 
 
