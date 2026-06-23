@@ -88,7 +88,27 @@ class FineTuningDataset(BaseDataset):
                 continue
 
             # メタデータを読み込む
-            if os.path.exists(subset.metadata_file):
+            if subset.tar_manager is not None and not os.path.exists(subset.metadata_file):
+                logger.info(f"loading metadata from tar: {subset.metadata_file}")
+                md_content = subset.tar_manager.read_text_file(subset.metadata_file)
+                if md_content is not None:
+                    if subset.metadata_file.endswith(".jsonl"):
+                        metadata = {}
+                        for line in md_content.strip().split('\n'):
+                            line_md = json.loads(line)
+                            image_md = {"caption": line_md.get("caption", "")}
+                            if "image_size" in line_md:
+                                image_md["image_size"] = line_md["image_size"]
+                            if "width" in line_md and "height" in line_md:
+                                image_md["image_size"] = [line_md["width"], line_md["height"]]
+                            if "tags" in line_md:
+                                image_md["tags"] = line_md["tags"]
+                            metadata[line_md["image_path"]] = image_md
+                    else:
+                        metadata = json.loads(md_content)
+                else:
+                    raise ValueError(f"no metadata in tar / ターアーカイブ内にメタデータファイルがありません: {subset.metadata_file}")
+            elif os.path.exists(subset.metadata_file):
                 if subset.metadata_file.endswith(".jsonl"):
                     logger.info(f"loading existing JSOL metadata: {subset.metadata_file}")
                     # optional JSONL format
@@ -206,7 +226,7 @@ class FineTuningDataset(BaseDataset):
                 if caption is None:
                     caption = ""
 
-                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset.caption_dropout_rate)
+                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset.caption_dropout_rate, tar_manager=subset.tar_manager)
                 image_info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
@@ -226,7 +246,7 @@ class FineTuningDataset(BaseDataset):
                 if self.skip_image_resolution is not None:
                     size = image_info.image_size
                     if size is None:  # no image size in metadata or latents cache file, get image size by reading image file (slow)
-                        size = self.get_image_size(abs_path)
+                        size = self.get_image_size(abs_path, tar_manager=subset.tar_manager)
                         image_info.image_size = size
                     skip_image_area = self.skip_image_resolution[0] * self.skip_image_resolution[1]
                     if size[0] * size[1] <= skip_image_area:
