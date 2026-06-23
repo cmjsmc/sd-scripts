@@ -167,7 +167,9 @@ IMAGE_TRANSFORMS = transforms.Compose(
 )
 
 
-def load_image(image_path, alpha=False):
+def load_image(image_path, alpha=False, tar_manager=None):
+    if tar_manager is not None:
+        return tar_manager.get_image(image_path, alpha)
     try:
         with Image.open(image_path) as image:
             if alpha:
