@@ -7,6 +7,7 @@ sampling settings applied to it.
 """
 
 from typing import Any, Dict, Optional, Tuple, Union
+from library.dataset import TarArchiveManager
 
 
 class BaseSubset:
@@ -36,6 +37,8 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -67,6 +70,9 @@ class BaseSubset:
         self.validation_split = validation_split
 
         self.resize_interpolation = resize_interpolation
+        self.dataset_tar_file = dataset_tar_file
+        self.dataset_passphrase = dataset_passphrase
+        self.tar_manager = TarArchiveManager(dataset_tar_file, dataset_passphrase) if dataset_tar_file else None
 
 
 class DreamBoothSubset(BaseSubset):
@@ -100,6 +106,8 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -128,6 +136,8 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            dataset_tar_file=dataset_tar_file,
+            dataset_passphrase=dataset_passphrase,
         )
 
         self.is_reg = is_reg
@@ -171,6 +181,8 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -199,6 +211,8 @@ class FineTuningSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            dataset_tar_file=dataset_tar_file,
+            dataset_passphrase=dataset_passphrase,
         )
 
         self.metadata_file = metadata_file
@@ -238,6 +252,8 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        dataset_tar_file: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -266,6 +282,8 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            dataset_tar_file=dataset_tar_file,
+            dataset_passphrase=dataset_passphrase,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
