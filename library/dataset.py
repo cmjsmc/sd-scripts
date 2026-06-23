@@ -205,6 +205,19 @@ class TarArchiveManager:
             logger.warning(f"Failed to read text file from tar: {filename}, error: {e}")
         return None
 
+    def get_resolved_path(self, filename: str) -> str:
+        """Helper to find the full path of a file inside the tar if it lacks an extension."""
+        norm_name = os.path.normpath(filename).replace('\\', '/')
+        if norm_name in self.members_map:
+            return filename
+        
+        # Check against supported image extensions
+        for ext in IMAGE_EXTENSIONS:
+            if norm_name + ext in self.members_map:
+                return filename + ext
+                
+        return filename
+
     def get_image(self, filename: str, alpha: bool = False):
         tar_member = self._get_member(filename)
         if not tar_member:
