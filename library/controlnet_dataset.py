@@ -85,6 +85,8 @@ class ControlNetDataset(BaseDataset):
                 subset.token_warmup_min,
                 subset.token_warmup_step,
                 resize_interpolation=subset.resize_interpolation,
+                dataset_tar_file=subset.dataset_tar_file,
+                dataset_passphrase=subset.dataset_passphrase,
             )
             db_subsets.append(db_subset)
 
